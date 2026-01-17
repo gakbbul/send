@@ -39,28 +39,26 @@
             const [myId, setMyId] = useState('');
             const [targetId, setTargetId] = useState('');
             const [status, setStatus] = useState('시스템 초기화 중...');
+            const [progress, setProgress] = useState(0);
             const [incomingFile, setIncomingFile] = useState(null);
             const [isTransferring, setIsTransferring] = useState(false);
+            
             const peerRef = useRef(null);
+            const receiveBuffer = useRef([]);
+            const receivedSize = useRef(0);
 
             const generateSimpleId = () => {
                 return Math.floor(10000 + Math.random() * 90000).toString();
             };
 
             const initPeer = (id) => {
-                if (peerRef.current) {
-                    peerRef.current.destroy();
-                }
+                if (peerRef.current) peerRef.current.destroy();
 
-                // Public STUN 서버 리스트 강화
                 const peer = new Peer(id, {
                     config: {
                         'iceServers': [
                             { url: 'stun:stun.l.google.com:19302' },
-                            { url: 'stun:stun1.l.google.com:19302' },
-                            { url: 'stun:stun2.l.google.com:19302' },
-                            { url: 'stun:stun3.l.google.com:19302' },
-                            { url: 'stun:stun4.l.google.com:19302' }
+                            { url: 'stun:stun1.l.google.com:19302' }
                         ]
                     },
                     debug: 1
@@ -74,44 +72,47 @@
                 });
 
                 peer.on('connection', (conn) => {
-                    setStatus('상대방 기기 연결됨');
+                    setStatus('기기 연결됨');
                     
                     conn.on('data', (data) => {
-                        if (data.type === 'file-offer') {
+                        // 파일 정보 수신
+                        if (data.type === 'file-start') {
                             setIncomingFile({ fileName: data.fileName, fileSize: data.fileSize });
-                            setStatus('파일 수신 중...');
+                            receiveBuffer.current = [];
+                            receivedSize.current = 0;
+                            setProgress(0);
+                            setStatus('수신 시작...');
                         }
                         
-                        if (data.type === 'file-data') {
-                            const blob = new Blob([data.file], { type: data.fileType });
+                        // 파일 조각 수신
+                        if (data.type === 'file-chunk') {
+                            receiveBuffer.current.push(data.chunk);
+                            receivedSize.current += data.chunk.byteLength;
+                            const percent = Math.floor((receivedSize.current / data.totalSize) * 100);
+                            setProgress(percent);
+                            setStatus(`수신 중: ${percent}%`);
+                        }
+
+                        // 수신 완료
+                        if (data.type === 'file-end') {
+                            const blob = new Blob(receiveBuffer.current, { type: data.fileType });
                             const url = window.URL.createObjectURL(blob);
                             const a = document.createElement('a');
                             a.href = url;
                             a.download = data.fileName;
                             a.click();
+                            
                             setStatus('다운로드 완료');
                             setIncomingFile(null);
+                            setProgress(0);
                             setTimeout(() => setStatus('접속 완료 (온라인)'), 3000);
                         }
-                    });
-
-                    conn.on('close', () => {
-                        setStatus('연결이 끊겼습니다');
-                        setTimeout(() => setStatus('접속 완료 (온라인)'), 3000);
                     });
                 });
 
                 peer.on('error', (err) => {
-                    console.error('PeerJS Error:', err.type);
-                    if (err.type === 'unavailable-id') {
-                        initPeer(generateSimpleId());
-                    } else if (err.type === 'peer-unavailable') {
-                        setStatus('오류: 대상을 찾을 수 없음');
-                        setIsTransferring(false);
-                    } else if (err.type === 'network') {
-                        setStatus('네트워크 연결 확인 필요');
-                        setIsTransferring(false);
-                    } else {
+                    if (err.type === 'unavailable-id') initPeer(generateSimpleId());
+                    else {
                         setStatus(`오류: ${err.type}`);
                         setIsTransferring(false);
                     }
@@ -125,69 +126,73 @@
                 };
             }, []);
 
-            const handleFileUpload = (e) => {
-                const file = e.target.files[0];
-                if (!file || !targetId) {
-                    if(!targetId) alert("받는 쪽 코드를 입력하세요.");
-                    return;
-                }
+            const sendFileInChunks = (file, conn) => {
+                const chunkSize = 16384; // 16KB 씩 쪼개서 전송 (안정적)
+                let offset = 0;
 
-                if (targetId === myId) {
-                    alert("자신에게 보낼 수 없습니다.");
-                    return;
-                }
-
-                setIsTransferring(true);
-                setStatus('경로 최적화 및 연결 시도...');
-
-                const conn = peerRef.current.connect(targetId, {
-                    reliable: true,
-                    serialization: 'binary'
+                // 시작 알림
+                conn.send({
+                    type: 'file-start',
+                    fileName: file.name,
+                    fileSize: file.size
                 });
-                
-                let timeout = setTimeout(() => {
-                    if (isTransferring) {
-                        setStatus('연결 시간 초과 (네트워크 확인)');
-                        setIsTransferring(false);
-                    }
-                }, 15000);
 
-                conn.on('open', () => {
-                    clearTimeout(timeout);
-                    setStatus('전송 시작...');
+                const readSlice = (o) => {
+                    const slice = file.slice(offset, o + chunkSize);
+                    const reader = new FileReader();
                     
-                    // 파일 메타데이터 송신
-                    conn.send({
-                        type: 'file-offer',
-                        fileName: file.name,
-                        fileSize: file.size
-                    });
+                    reader.onload = (e) => {
+                        conn.send({
+                            type: 'file-chunk',
+                            chunk: e.target.result,
+                            totalSize: file.size
+                        });
 
-                    // 실제 데이터 송신
-                    conn.send({
-                        type: 'file-data',
-                        file: file,
-                        fileName: file.name,
-                        fileType: file.type
-                    });
+                        offset += chunkSize;
+                        const percent = Math.floor((offset / file.size) * 100);
+                        setProgress(percent > 100 ? 100 : percent);
 
-                    setTimeout(() => {
-                        setIsTransferring(false);
-                        setStatus('전송 완료!');
-                        setTimeout(() => setStatus('접속 완료 (온라인)'), 3000);
-                    }, 2000);
-                });
+                        if (offset < file.size) {
+                            readSlice(offset);
+                        } else {
+                            // 전송 완료 알림
+                            conn.send({
+                                type: 'file-end',
+                                fileName: file.name,
+                                fileType: file.type
+                            });
+                            setIsTransferring(false);
+                            setStatus('전송 완료!');
+                            setTimeout(() => {
+                                setStatus('접속 완료 (온라인)');
+                                setProgress(0);
+                            }, 3000);
+                        }
+                    };
+                    reader.readAsArrayBuffer(slice);
+                };
 
-                conn.on('error', (err) => {
-                    clearTimeout(timeout);
-                    setStatus('연결 실패');
-                    setIsTransferring(false);
-                });
+                readSlice(0);
             };
 
-            const resetConnection = () => {
-                setStatus('재연결 중...');
-                initPeer(generateSimpleId());
+            const handleFileUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file || !targetId) return;
+
+                setIsTransferring(true);
+                setStatus('연결 수립 중...');
+
+                const conn = peerRef.current.connect(targetId, { reliable: true });
+                
+                conn.on('open', () => {
+                    setStatus('전송 시작...');
+                    sendFileInChunks(file, conn);
+                });
+
+                conn.on('error', () => {
+                    setStatus('전송 실패');
+                    setIsTransferring(false);
+                });
             };
 
             return (
@@ -195,32 +200,26 @@
                     <div className="w-full max-w-md">
                         <header className="text-center mb-8">
                             <h1 className="text-4xl font-black text-slate-900 tracking-tight mb-2">QuickShare</h1>
-                            <p className="text-slate-500 text-sm font-medium uppercase tracking-widest">Secure P2P Transfer</p>
+                            <p className="text-slate-500 text-sm font-medium uppercase tracking-widest">Stable P2P Transfer</p>
                         </header>
 
-                        {/* 내 정보 영역 */}
                         <div className="bg-white rounded-3xl p-6 shadow-xl mb-6 border border-slate-200">
-                            <div className="flex justify-between items-start mb-4">
-                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">My Access Code</span>
-                                <button onClick={resetConnection} className="text-[10px] font-bold text-blue-600 hover:underline">ID 재발급</button>
+                            <div className="flex justify-between items-start mb-2">
+                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">My Code</span>
                             </div>
                             <div className="flex items-center justify-between bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                                <span className="text-4xl font-mono font-black text-blue-600 tracking-widest leading-none">
+                                <span className="text-4xl font-mono font-black text-blue-600 tracking-widest">
                                     {myId || '-----'}
                                 </span>
-                                <div className="text-right">
-                                    <div className={`text-[10px] font-bold px-2 py-0.5 rounded-full inline-block mb-1 ${myId ? 'bg-green-100 text-green-600' : 'bg-orange-100 text-orange-600'}`}>
-                                        {myId ? 'ID READY' : 'WAITING'}
-                                    </div>
-                                    <p className="text-[9px] text-slate-400 font-medium">상대방에게 이 코드를 알려주세요</p>
+                                <div className={`text-[10px] font-bold px-3 py-1 rounded-full ${myId ? 'bg-green-100 text-green-600' : 'bg-orange-100 text-orange-600'}`}>
+                                    {myId ? 'READY' : 'WAITING'}
                                 </div>
                             </div>
                         </div>
 
-                        {/* 파일 보내기 영역 */}
                         <div className="glass rounded-3xl p-6 shadow-2xl mb-6">
                             <div className="mb-6">
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-2 ml-1">받는 사람 코드 (5자리)</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-2 ml-1">받는 쪽 코드 (5자리)</label>
                                 <input 
                                     type="text" 
                                     maxLength="5"
@@ -231,42 +230,50 @@
                                 />
                             </div>
 
-                            <label className={`relative group cursor-pointer block border-2 border-dashed border-slate-200 rounded-3xl p-10 hover:border-blue-400 hover:bg-blue-50/30 transition-all ${isTransferring || !targetId ? 'opacity-50 grayscale' : ''}`}>
+                            <label className={`relative group cursor-pointer block border-2 border-dashed border-slate-200 rounded-3xl p-10 hover:border-blue-400 hover:bg-blue-50/30 transition-all ${isTransferring || !targetId ? 'opacity-50 pointer-events-none' : ''}`}>
                                 <div className="text-center">
                                     <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg group-hover:scale-110 transition-transform">
                                         <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
                                         </svg>
                                     </div>
-                                    <h2 className="text-lg font-bold text-slate-800">파일 선택 및 전송</h2>
-                                    <p className="text-xs text-slate-400 mt-1 italic">선택 즉시 전송이 시작됩니다</p>
+                                    <h2 className="text-lg font-bold text-slate-800">파일 전송하기</h2>
                                 </div>
-                                <input 
-                                    type="file" 
-                                    className="hidden" 
-                                    onChange={handleFileUpload} 
-                                    disabled={isTransferring || !targetId}
-                                />
+                                <input type="file" className="hidden" onChange={handleFileUpload} disabled={isTransferring || !targetId} />
                             </label>
+
+                            {/* 진행 표시바 */}
+                            {(isTransferring || progress > 0) && (
+                                <div className="mt-6">
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-400 mb-1 px-1 uppercase">
+                                        <span>Progress</span>
+                                        <span>{progress}%</span>
+                                    </div>
+                                    <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                                        <div 
+                                            className="bg-blue-600 h-full transition-all duration-300" 
+                                            style={{ width: `${progress}%` }}
+                                        ></div>
+                                    </div>
+                                </div>
+                            )}
                             
-                            <div className="mt-6 flex items-center justify-center gap-2">
-                                <div className={`w-2 h-2 rounded-full ${status.includes('오류') ? 'bg-red-500' : 'bg-blue-500 animate-pulse'}`}></div>
-                                <span className="text-[11px] font-bold text-slate-600">{status}</span>
+                            <div className="mt-4 flex items-center justify-center gap-2">
+                                <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+                                <span className="text-[11px] font-bold text-slate-600 uppercase tracking-tight">{status}</span>
                             </div>
                         </div>
 
-                        {/* 수신 알림 모달 형태 */}
                         {incomingFile && (
                             <div className="fixed inset-x-6 bottom-10 animate-bounce">
                                 <div className="glass p-5 rounded-3xl shadow-2xl border-2 border-blue-500 flex items-center gap-4">
-                                    <div className="w-12 h-12 bg-blue-100 rounded-xl flex items-center justify-center text-blue-600">
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                                    <div className="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center text-blue-600">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                        <p className="text-[10px] font-black text-blue-600 uppercase">Incoming File</p>
                                         <h4 className="font-bold text-slate-800 truncate text-sm">{incomingFile.fileName}</h4>
+                                        <p className="text-[10px] text-blue-600 font-bold uppercase">{progress}% 수신 완료</p>
                                     </div>
-                                    <div className="text-[10px] font-bold text-slate-400">자동 다운로드 중...</div>
                                 </div>
                             </div>
                         )}
